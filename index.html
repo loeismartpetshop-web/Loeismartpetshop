@@ -1186,15 +1186,11 @@ body.tpl-square .card-preview-btn { border-radius: 0 !important; }
     /* ============================================================
        CONFIG
        ============================================================ */
-    const ADMIN_PASSWORD = '1234';
     const BATCH_SIZE = 30;
     const SEARCH_DEBOUNCE_MS = 200;
 
     // ⚠️ ใส่ URL ของ GAS Web App ที่ Deploy แล้วตรงนี้
-    const GAS_ENDPOINT = 'https://script.google.com/macros/s/AKfycbyQhqzSEpYR8djNgN642lpg_XULQKKDG9Jsse82PZRUzzRGzSGamAfcs46RkDucPDAn/exec';
-
-    // 🔑 SECRET_KEY
-    const GAS_SECRET_KEY = 'sgYdqjJi4fnS3tMWiD3DCpZpdkEvHDlAAdj7RoHr';
+    const GAS_ENDPOINT = 'https://script.google.com/macros/s/AKfycby52hjN5G71641mcrCk2pKbLw15TcNXchahk_GDUIONlUsxza0osRP0U4Xha05dJOh2/exec';
 
     // 🗺️ Longdo Map API Key — ใช้กับ lazy loader ด้านล่าง
     const LONGDO_MAP_KEY = '32344a31ec7f657884db5a210abb2df4';
@@ -1266,12 +1262,31 @@ body.tpl-square .card-preview-btn { border-radius: 0 !important; }
        ============================================================ */
     const queue = [];
     let queueRunning = false;
+    let adminAuthToken = sessionStorage.getItem('loeiAdminAuthToken') || '';
+
+    const ADMIN_API_ACTIONS = new Set([
+        'saveAll', 'uploadImage',
+        'acquireLock', 'heartbeat', 'releaseLock', 'forceAcquireLock',
+        'startAdminSession', 'adminSessionHeartbeat', 'endAdminSession',
+        'acquireResourceLock', 'forceAcquireResourceLock', 'releaseResourceLock',
+        'saveAdminPatch', 'saveAdminDraft', 'getAdminDraft', 'clearAdminDraft'
+    ]);
+
+    function buildApiPayload(action, payload) {
+        const body = { ...(payload || {}), action };
+        if (ADMIN_API_ACTIONS.has(action)) {
+            if (!body.sessionId && adminSessionId) body.sessionId = adminSessionId;
+            if (!body.adminName && adminName) body.adminName = adminName;
+            body.adminAuthToken = adminAuthToken || '';
+        }
+        return body;
+    }
 
     function enqueue(action, payload) {
         const item = {
             id: 'q-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
             action,
-            payload: { ...payload, action, key: GAS_SECRET_KEY },
+            payload: buildApiPayload(action, payload),
             attempts: 0,
             status: 'PENDING',
             resolve: null, reject: null,
@@ -1454,7 +1469,7 @@ body.tpl-square .card-preview-btn { border-radius: 0 !important; }
             const res = await fetch(GAS_ENDPOINT, {
                 method: 'POST',
                 headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                body: JSON.stringify({ action: 'loadCatalog', key: GAS_SECRET_KEY }),
+                body: JSON.stringify({ action: 'loadCatalog' }),
                 redirect: 'follow',
             });
             if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -1487,7 +1502,7 @@ body.tpl-square .card-preview-btn { border-radius: 0 !important; }
             const res = await fetch(GAS_ENDPOINT, {
                 method: 'POST',
                 headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                body: JSON.stringify({ action: 'loadCatalog', key: GAS_SECRET_KEY }),
+                body: JSON.stringify({ action: 'loadCatalog' }),
                 redirect: 'follow',
             });
             if (!res.ok) return;
@@ -2583,11 +2598,62 @@ body.tpl-square .card-preview-btn { border-radius: 0 !important; }
     function openAdminAuth() { $('adminPwInput').value = ''; $('adminAuthModal').classList.add('open'); setTimeout(() => $('adminPwInput').focus(), 150); }
     function closeAdminAuth() { $('adminAuthModal').classList.remove('open'); }
     async function verifyAdmin() {
-        if ($('adminPwInput').value !== ADMIN_PASSWORD) {
-            showToast('รหัสผ่านไม่ถูกต้อง'); $('adminPwInput').value = ''; $('adminPwInput').focus(); return;
+        const input = $('adminPwInput');
+        const btn = $('verifyAdminBtn');
+        const password = input.value || '';
+        if (!password.trim()) {
+            showToast('กรุณากรอกรหัสผ่าน');
+            input.focus();
+            return;
         }
-        closeAdminAuth();
-        await openAdmin();
+        if (!isGasConfigured()) {
+            closeAdminAuth();
+            await openAdmin();
+            return;
+        }
+        ensureAdminSession();
+        if (btn) { btn.disabled = true; btn.textContent = 'กำลังตรวจสอบ...'; }
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 12000);
+            let res;
+            try {
+                res = await fetch(GAS_ENDPOINT, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    body: JSON.stringify({
+                        action: 'adminLogin',
+                        adminPassword: password,
+                        sessionId: adminSessionId,
+                        adminName,
+                        deviceInfo: navigator.userAgent || ''
+                    }),
+                    redirect: 'follow',
+                    signal: controller.signal,
+                });
+            } finally {
+                clearTimeout(timeoutId);
+            }
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const data = JSON.parse(await res.text());
+            if (data.ok !== true && data.success !== true) {
+                throw new Error(data.error || 'รหัสผ่านไม่ถูกต้อง');
+            }
+            adminAuthToken = data.adminAuthToken || '';
+            sessionStorage.setItem('loeiAdminAuthToken', adminAuthToken);
+            input.value = '';
+            closeAdminAuth();
+            await openAdmin();
+        } catch (err) {
+            console.warn('[adminLogin]', err);
+            adminAuthToken = '';
+            sessionStorage.removeItem('loeiAdminAuthToken');
+            showToast(err.message || 'รหัสผ่านไม่ถูกต้อง');
+            input.value = '';
+            input.focus();
+        } finally {
+            if (btn) { btn.disabled = false; btn.textContent = 'เข้าสู่ระบบ'; }
+        }
     }
 
     /* ============================================================
@@ -2873,7 +2939,7 @@ body.tpl-square .card-preview-btn { border-radius: 0 !important; }
         return fetch(GAS_ENDPOINT, {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({ ...(payload || {}), action, key: GAS_SECRET_KEY }),
+            body: JSON.stringify(buildApiPayload(action, payload)),
             redirect: 'follow',
             signal: controller.signal,
         }).then(async res => {
@@ -3186,7 +3252,7 @@ body.tpl-square .card-preview-btn { border-radius: 0 !important; }
             const res = await fetch(GAS_ENDPOINT, {
                 method: 'POST',
                 headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                body: JSON.stringify({ action: 'loadCatalog', key: GAS_SECRET_KEY }),
+                body: JSON.stringify({ action: 'loadCatalog' }),
                 redirect: 'follow',
             });
             if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -3306,7 +3372,7 @@ body.tpl-square .card-preview-btn { border-radius: 0 !important; }
         stopAdminHeartbeat();
         stopAdminAutosave();
         if (useBeacon && navigator.sendBeacon) {
-            const body = JSON.stringify({ action: 'endAdminSession', key: GAS_SECRET_KEY, sessionId: sid });
+            const body = JSON.stringify(buildApiPayload('endAdminSession', { sessionId: sid }));
             navigator.sendBeacon(GAS_ENDPOINT, new Blob([body], { type: 'text/plain;charset=utf-8' }));
             return;
         }
